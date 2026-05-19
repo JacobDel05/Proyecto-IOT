@@ -1,0 +1,322 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <math.h>
+
+#include <AES.h>
+
+#define MPU 0x68
+#define PIN_LED 2
+
+// WIFI
+
+
+const char* ssid = "Galaxy A51 9877";
+const char* password = "bjgb4629";
+// MQTT
+
+const char* mqtt_server = "192.168.70.132"; 
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// AES
+
+// 16 bytes = AES128
+byte aesKey[16] = {
+  '1','2','3','4',
+  '5','6','7','8',
+  '9','A','B','C',
+  'D','E','F','G'
+};
+
+AES128 aes;
+
+// VARIABLES MPU
+
+float offsetX = 0;
+float offsetY = 0;
+float offsetZ = 0;
+
+float pitchFiltrado = 0;
+float alpha = 0.15;
+
+unsigned long tiempoMalaPostura = 0;
+
+// ESCRIBIR REGISTRO MPU
+
+void writeReg(uint8_t reg, uint8_t val) {
+
+  Wire.beginTransmission(MPU);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+// LEER ACELERÓMETRO
+
+
+bool readAccel(int16_t &ax, int16_t &ay, int16_t &az) {
+
+  Wire.beginTransmission(MPU);
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  if (Wire.requestFrom(MPU, 6) != 6) {
+    return false;
+  }
+
+  ax = (Wire.read() << 8) | Wire.read();
+  ay = (Wire.read() << 8) | Wire.read();
+  az = (Wire.read() << 8) | Wire.read();
+
+  return true;
+}
+
+// CALIBRACIÓN
+
+void calibrar() {
+
+  Serial.println("Calibrando MPU...");
+
+  long sx = 0;
+  long sy = 0;
+  long sz = 0;
+
+  int validas = 0;
+
+  int16_t ax, ay, az;
+
+  for (int i = 0; i < 200; i++) {
+
+    if (readAccel(ax, ay, az)) {
+
+      sx += ax;
+      sy += ay;
+      sz += az;
+
+      validas++;
+    }
+
+    delay(10);
+  }
+
+  offsetX = sx / (float)validas;
+  offsetY = sy / (float)validas;
+  offsetZ = sz / (float)validas;
+
+  Serial.println("Calibración lista");
+}
+// WIFI
+
+void setup_wifi() {
+
+  delay(100);
+
+  Serial.println();
+  Serial.print("Conectando a WiFi ");
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi conectado");
+
+  Serial.print("IP ESP32: ");
+  Serial.println(WiFi.localIP());
+}
+// MQTT
+
+void reconnectMQTT() {
+
+  while (!client.connected()) {
+
+    Serial.print("Conectando MQTT...");
+
+    if (client.connect("ESP32_POSTURA")) {
+
+      Serial.println(" conectado");
+
+    } else {
+
+      Serial.print(" fallo rc=");
+      Serial.println(client.state());
+
+      delay(2000);
+    }
+  }
+}
+
+// CIFRAR MENSAJE AES
+
+String encryptAES(String mensaje) {
+
+  byte plain[16];
+  byte cipher[16];
+
+  memset(plain, 0, 16);
+
+  mensaje.getBytes(plain, 16);
+
+  aes.setKey(aesKey, 16);
+  aes.encryptBlock(cipher, plain);
+
+  String encrypted = "";
+
+  for (int i = 0; i < 16; i++) {
+
+    if (cipher[i] < 16) encrypted += "0";
+
+    encrypted += String(cipher[i], HEX);
+  }
+
+  return encrypted;
+}
+
+// SETUP
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(3000);
+
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+
+  // I2C
+
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+
+  Serial.println("Iniciando MPU6050...");
+
+  writeReg(0x6B, 0x80);
+  delay(200);
+
+  writeReg(0x6B, 0x00);
+  delay(200);
+
+  writeReg(0x1C, 0x00);
+  writeReg(0x1B, 0x00);
+
+  Wire.beginTransmission(MPU);
+
+  if (Wire.endTransmission() != 0) {
+
+    Serial.println("ERROR MPU");
+
+    while (1) delay(10);
+  }
+
+  Serial.println("MPU detectado");
+
+  calibrar();
+
+  // WIFI + MQTT
+
+  setup_wifi();
+
+  client.setServer(mqtt_server, 1883);
+}
+// LOOP
+
+void loop() {
+
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+
+  client.loop();
+
+  int16_t ax, ay, az;
+
+  if (!readAccel(ax, ay, az)) {
+
+    Serial.println("Error lectura MPU");
+    delay(200);
+    return;
+  }
+
+  // CONVERTIR A g
+
+  float ax_g = (ax - offsetX) / 16384.0;
+  float ay_g = (ay - offsetY) / 16384.0;
+  float az_g = (az - offsetZ) / 16384.0;
+
+  // PITCH
+  float pitchRaw =
+    atan2(
+      ax_g,
+      sqrt(ay_g * ay_g + az_g * az_g)
+    ) * 180.0 / M_PI;
+
+  pitchFiltrado =
+    alpha * pitchRaw +
+    (1.0 - alpha) * pitchFiltrado;
+
+  // ESTADO
+  String estado = "POSTURA_OK";
+
+  if (abs(pitchFiltrado) > 25) {
+
+    estado = "MALA_POSTURA";
+
+    if (tiempoMalaPostura == 0) {
+      tiempoMalaPostura = millis();
+    }
+
+    if (millis() - tiempoMalaPostura >= 3000) {
+
+      Serial.println("⚠ ALERTA MALA POSTURA");
+
+      // LED
+      digitalWrite(PIN_LED, HIGH);
+      delay(150);
+
+      digitalWrite(PIN_LED, LOW);
+      delay(150);
+
+      digitalWrite(PIN_LED, HIGH);
+      delay(150);
+
+      digitalWrite(PIN_LED, LOW);
+
+      // MENSAJE MQTT CIFRADO
+      String mensaje =
+        "ALERTA|Pitch:" +
+        String(pitchFiltrado, 2);
+
+      String cifrado = encryptAES(mensaje);
+
+      client.publish(
+        "postura/alerta",
+        cifrado.c_str()
+      );
+
+      Serial.println("Mensaje cifrado enviado MQTT");
+
+      tiempoMalaPostura = millis();
+    }
+
+  } else {
+
+    tiempoMalaPostura = 0;
+  }
+
+  // SERIAL
+  Serial.print("Pitch: ");
+  Serial.print(pitchFiltrado);
+
+  Serial.print(" | Estado: ");
+  Serial.println(estado);
+
+  delay(200);
+}

@@ -11,8 +11,9 @@
 // WIFI
 
 
-const char* ssid = "Galaxy A51 9877";
-const char* password = "bjgb4629";
+const char* ssid = "TU_WIFI";
+const char* password = "TU_PASSWORD";
+
 // MQTT
 
 const char* mqtt_server = "192.168.70.132"; 
